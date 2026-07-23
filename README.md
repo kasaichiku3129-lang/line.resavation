@@ -1,6 +1,6 @@
 # 注文集計アプリ
 
-CSVをアップロードして、商品別数量集計と注文票PDFを作成するStreamlitアプリです。
+CSVをアップロードして、商品別・時間帯別の数量集計と注文票PDFを作成するStreamlitアプリです。
 
 ## Streamlit Cloud
 
