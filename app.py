@@ -1,4 +1,5 @@
 import html
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -21,6 +22,7 @@ TICKET_EXCLUDE_PRODUCT_NAMES = [
     "税抜金額",
 ]
 TICKET_AMOUNT_PRODUCT_NAMES = ["税込金額"]
+SALES_EXCLUDE_PRODUCT_NAMES = TICKET_EXCLUDE_PRODUCT_NAMES + TICKET_AMOUNT_PRODUCT_NAMES
 STEAK_CUT_PRODUCT_NAME = "黒毛和牛ステーキ切り落とし"
 STEAK_CUT_PRODUCT_KEYWORDS = ["黒毛和牛", "ステーキ", "切り落とし"]
 
@@ -69,6 +71,11 @@ def format_display_value(value):
     if pd.isna(value):
         return ""
     return str(value)
+
+
+def sanitize_print_text(value):
+    text = format_display_value(value)
+    return " ".join(text.replace("\u3000", " ").split())
 
 
 def format_amount(value):
@@ -122,6 +129,334 @@ def sorted_time_labels(values):
         if format_time_label(value)
     }
     return sorted(labels, key=time_sort_key)
+
+
+def prepare_sales_df(df):
+    sales_df = df.copy()
+    sales_df["集計日"] = pd.to_datetime(sales_df["お渡し日"], errors="coerce").dt.date
+    sales_df["集計月"] = pd.to_datetime(sales_df["お渡し日"], errors="coerce").dt.to_period("M")
+    if "店舗名" in sales_df.columns:
+        sales_df["店舗名"] = (
+            sales_df["店舗名"]
+            .map(sanitize_print_text)
+            .replace("", pd.NA)
+            .fillna("店舗名なし")
+        )
+    if "商品名" in sales_df.columns:
+        sales_df["商品名"] = sales_df["商品名"].map(
+            lambda value: sanitize_print_text(value) if pd.notna(value) else value
+        )
+
+    quantity = pd.to_numeric(sales_df["数量"], errors="coerce")
+    unit_price = pd.to_numeric(sales_df["金額"], errors="coerce").fillna(0)
+    # CSVは数量が複数のとき金額列が単価のみになるため、数量>1は数量×単価で計上する。
+    # 税込・税抜・クーポン行は金額をそのまま使う。
+    is_product_row = (
+        sales_df["商品名"].notna()
+        & (sales_df["商品名"] != "")
+        & ~sales_df["商品名"].isin(SALES_EXCLUDE_PRODUCT_NAMES)
+    )
+    multiply_mask = is_product_row & quantity.notna() & (quantity > 1)
+    sales_df["売上金額"] = unit_price
+    sales_df.loc[multiply_mask, "売上金額"] = (
+        quantity[multiply_mask] * unit_price[multiply_mask]
+    )
+    sales_df["集計数量"] = quantity.fillna(0)
+    sales_df["単価"] = unit_price
+    return sales_df
+
+
+def filter_order_sales_df(sales_df):
+    """注文票と同じく、商品名が「税込金額」の行を売上として使う。"""
+    return sales_df[sales_df["商品名"].isin(TICKET_AMOUNT_PRODUCT_NAMES)].copy()
+
+
+def filter_product_sales_df(sales_df):
+    """商品別集計用。クーポン・税抜・税込の行は除外する。"""
+    return sales_df[
+        sales_df["商品名"].notna()
+        & (sales_df["商品名"] != "")
+        & ~sales_df["商品名"].isin(SALES_EXCLUDE_PRODUCT_NAMES)
+    ].copy()
+
+
+def build_sales_amount_reconciliation(product_df, order_df):
+    product_total = float(product_df["売上金額"].sum()) if not product_df.empty else 0.0
+    order_total = float(order_df["売上金額"].sum()) if not order_df.empty else 0.0
+    difference = product_total - order_total
+    matched = abs(difference) < 0.5
+
+    store_names = sorted(
+        set(product_df["店舗名"].dropna().tolist() if not product_df.empty else [])
+        | set(order_df["店舗名"].dropna().tolist() if not order_df.empty else [])
+    )
+    store_rows = []
+    for store_name in store_names:
+        product_amount = float(
+            product_df.loc[product_df["店舗名"] == store_name, "売上金額"].sum()
+        )
+        order_amount = float(
+            order_df.loc[order_df["店舗名"] == store_name, "売上金額"].sum()
+        )
+        store_difference = product_amount - order_amount
+        store_rows.append(
+            {
+                "店舗名": store_name,
+                "商品合計": product_amount,
+                "税込金額": order_amount,
+                "差額": store_difference,
+                "一致": abs(store_difference) < 0.5,
+            }
+        )
+    store_compare = pd.DataFrame(store_rows)
+
+    mismatch_orders = pd.DataFrame(
+        columns=["注文番号", "店舗名", "商品合計", "税込金額", "差額"]
+    )
+    if (
+        "注文番号" in product_df.columns
+        and "注文番号" in order_df.columns
+        and not product_df.empty
+        and not order_df.empty
+    ):
+        product_by_order = (
+            product_df.dropna(subset=["注文番号"])
+            .groupby(["注文番号", "店舗名"], as_index=False)["売上金額"]
+            .sum()
+            .rename(columns={"売上金額": "商品合計"})
+        )
+        order_by_order = (
+            order_df.dropna(subset=["注文番号"])
+            .groupby(["注文番号", "店舗名"], as_index=False)["売上金額"]
+            .sum()
+            .rename(columns={"売上金額": "税込金額"})
+        )
+        compared = product_by_order.merge(
+            order_by_order,
+            on=["注文番号", "店舗名"],
+            how="outer",
+        ).fillna(0)
+        compared["差額"] = compared["商品合計"] - compared["税込金額"]
+        mismatch_orders = compared[compared["差額"].abs() >= 0.5].sort_values(
+            ["店舗名", "注文番号"]
+        )
+
+    return {
+        "product_total": product_total,
+        "order_total": order_total,
+        "difference": difference,
+        "matched": matched,
+        "store_compare": store_compare,
+        "mismatch_orders": mismatch_orders,
+    }
+
+
+def format_month_label(period_value):
+    if pd.isna(period_value):
+        return ""
+    return f"{period_value.year}年{period_value.month}月"
+
+
+def classify_store_group(store_name):
+    name = sanitize_print_text(store_name)
+    if "神宮寺" in name:
+        return 0
+    if "STAND" in name.upper():
+        return 1
+    return 2
+
+
+def ordered_store_names(store_names):
+    unique_names = sorted(
+        {sanitize_print_text(name) for name in store_names if sanitize_print_text(name)}
+    )
+    return sorted(unique_names, key=lambda name: (classify_store_group(name), name))
+
+
+def aggregate_sales_by_store(sales_df):
+    summary = (
+        sales_df.groupby("店舗名", as_index=False)
+        .agg(売上金額=("売上金額", "sum"))
+    )
+    if summary.empty:
+        return summary
+    summary["店舗順"] = summary["店舗名"].map(classify_store_group)
+    return summary.sort_values(["店舗順", "店舗名"]).drop(columns=["店舗順"])
+
+
+def aggregate_sales_by_store_product(sales_df):
+    return (
+        sales_df.groupby(["店舗名", "商品名"], as_index=False)
+        .agg(数量=("集計数量", "sum"), 売上金額=("売上金額", "sum"))
+        .sort_values(["店舗名", "売上金額", "商品名"], ascending=[True, False, True])
+    )
+
+
+def aggregate_sales_by_store_day(sales_df):
+    daily = (
+        sales_df.dropna(subset=["集計日"])
+        .groupby(["店舗名", "集計日"], as_index=False)
+        .agg(売上金額=("売上金額", "sum"))
+        .sort_values(["店舗名", "集計日"])
+    )
+    daily["日にち"] = daily["集計日"].map(
+        lambda value: value.strftime("%m月%d日") if pd.notna(value) else ""
+    )
+    return daily[["店舗名", "日にち", "売上金額"]]
+
+
+def build_store_product_rows(product_summary):
+    rows = []
+    for _, row in product_summary.sort_values(
+        ["売上金額", "商品名"], ascending=[False, True]
+    ).iterrows():
+        product_name = html.escape(sanitize_print_text(row["商品名"]))
+        quantity = html.escape(format_quantity(row["数量"]))
+        amount = html.escape(format_amount(row["売上金額"]))
+        rows.append(
+            f"<tr><td>{product_name}</td><td>{quantity}</td><td>{amount}</td></tr>"
+        )
+    return rows
+
+
+def build_store_day_rows(day_summary):
+    rows = []
+    for _, row in day_summary.iterrows():
+        day_label = html.escape(sanitize_print_text(row["日にち"]))
+        amount = html.escape(format_amount(row["売上金額"]))
+        rows.append(f"<tr><td>{day_label}</td><td>{amount}</td></tr>")
+    return rows
+
+
+def build_store_detail_section(store_name, store_amount, product_summary, day_summary):
+    product_rows = build_store_product_rows(product_summary)
+    day_rows = build_store_day_rows(day_summary)
+    product_body = (
+        "\n".join(product_rows)
+        if product_rows
+        else '<tr><td colspan="3">データなし</td></tr>'
+    )
+    day_body = (
+        "\n".join(day_rows)
+        if day_rows
+        else '<tr><td colspan="2">データなし</td></tr>'
+    )
+    store_label = html.escape(sanitize_print_text(store_name))
+    amount_label = html.escape(format_amount(store_amount))
+    return f"""
+<section class="print-section store-detail-section">
+    <h2>{store_label}</h2>
+    <div class="print-section-meta">売上高: {amount_label}</div>
+    <div class="sales-print-columns">
+        <div>
+            <h3>商品別売上（金額降順）</h3>
+            <table class="print-table sales-product-table">
+                <thead>
+                    <tr>
+                        <th>商品名</th>
+                        <th>数量</th>
+                        <th>金額</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {product_body}
+                </tbody>
+            </table>
+        </div>
+        <div>
+            <h3>日にち別売上</h3>
+            <table class="print-table sales-day-table">
+                <thead>
+                    <tr>
+                        <th>日にち</th>
+                        <th>金額</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {day_body}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</section>
+""".strip()
+
+
+def build_sales_print_report(
+    period_label,
+    store_summary,
+    store_product_summary,
+    store_day_summary,
+):
+    total_amount = store_summary["売上金額"].sum()
+    store_rows = []
+    for _, row in store_summary.iterrows():
+        store_name = html.escape(sanitize_print_text(row["店舗名"]))
+        amount = html.escape(format_amount(row["売上金額"]))
+        store_rows.append(f"<tr><td>{store_name}</td><td>{amount}</td></tr>")
+
+    store_names = ordered_store_names(store_summary["店舗名"].tolist())
+    detail_sections = []
+    for store_name in store_names:
+        store_amount_rows = store_summary[store_summary["店舗名"] == store_name]
+        store_amount = (
+            float(store_amount_rows["売上金額"].sum())
+            if not store_amount_rows.empty
+            else 0.0
+        )
+        product_summary = store_product_summary[
+            store_product_summary["店舗名"] == store_name
+        ]
+        day_summary = store_day_summary[store_day_summary["店舗名"] == store_name]
+        detail_sections.append(
+            build_store_detail_section(
+                store_name,
+                store_amount,
+                product_summary,
+                day_summary,
+            )
+        )
+
+    store_rows_html = "\n".join(store_rows)
+    detail_sections_html = "\n".join(detail_sections)
+    period_text = html.escape(sanitize_print_text(period_label))
+    total_text = html.escape(format_amount(total_amount))
+
+    return f"""
+<div class="print-area sales-print-area">
+    <div class="print-header">
+        <h1>当月売上集計</h1>
+        <div class="print-date">期間: {period_text}</div>
+    </div>
+    <div class="print-section-meta">
+        店舗別・日にち別は「税込金額」。商品別は数量が2以上のとき数量×単価、それ以外は金額列を集計。
+        表示順は神宮寺店 → STAND です。
+    </div>
+
+    <section class="print-section sales-summary-section">
+        <h2>期間中の店舗別売上高</h2>
+        <table class="print-table sales-store-table">
+            <thead>
+                <tr>
+                    <th>店舗名</th>
+                    <th>売上高</th>
+                </tr>
+            </thead>
+            <tbody>
+                {store_rows_html}
+            </tbody>
+            <tfoot>
+                <tr>
+                    <th>合計</th>
+                    <th>{total_text}</th>
+                </tr>
+            </tfoot>
+        </table>
+    </section>
+
+    {detail_sections_html}
+</div>
+""".strip()
 
 
 def get_japanese_font():
@@ -328,6 +663,7 @@ def build_print_report(
     steak_name_summary,
     selected_times=None,
     time_product_summary=None,
+    selected_time_products=None,
 ):
     rows = []
     for _, row in product_summary.iterrows():
@@ -367,10 +703,20 @@ def build_print_report(
                 f"<tr><td>{time_value}</td><td>{product_name}</td><td>{quantity}</td></tr>"
             )
         time_total_quantity = time_product_summary["数量"].sum()
+        if selected_time_products:
+            product_label = " / ".join(selected_time_products)
+            time_section_meta = (
+                f'<div class="print-section-meta">'
+                f"対象商品: {html.escape(product_label)}"
+                f"</div>"
+            )
+        else:
+            time_section_meta = ""
         time_summary_table = dedent(
             f"""
             <section class="print-section">
                 <h2>時間帯別 商品数量</h2>
+                {time_section_meta}
                 <table class="print-table time-summary-table">
                     <thead>
                         <tr>
@@ -525,6 +871,13 @@ def apply_print_styles():
             margin: 0 0 10px;
         }
 
+        .print-section-meta {
+            font-size: 13px;
+            color: #374151;
+            margin: -4px 0 10px;
+            line-height: 1.45;
+        }
+
         .steak-summary-table th:first-child,
         .steak-summary-table td:first-child {
             width: 120px;
@@ -538,6 +891,81 @@ def apply_print_styles():
         .time-summary-table td:last-child,
         .time-summary-table th:last-child {
             width: 140px;
+        }
+
+        .sales-print-area {
+            max-width: 980px;
+        }
+
+        .sales-print-area .print-header h1 {
+            font-size: 24px;
+        }
+
+        .sales-print-area .print-section {
+            margin-top: 16px;
+        }
+
+        .sales-print-area .print-section h2 {
+            font-size: 16px;
+            margin: 0 0 6px;
+        }
+
+        .sales-print-area .print-table {
+            font-size: 12px;
+        }
+
+        .sales-print-area .print-table th,
+        .sales-print-area .print-table td {
+            padding: 4px 8px;
+        }
+
+        .sales-print-area .print-table tfoot th {
+            font-size: 13px;
+        }
+
+        .sales-summary-section .print-table {
+            max-width: 420px;
+        }
+
+        .sales-print-columns {
+            display: grid;
+            grid-template-columns: 1.35fr 1fr;
+            gap: 18px;
+            align-items: start;
+        }
+
+        .store-detail-section {
+            border-top: 1px solid #d1d5db;
+            padding-top: 12px;
+        }
+
+        .store-detail-section h3 {
+            font-size: 13px;
+            line-height: 1.3;
+            margin: 0 0 6px;
+        }
+
+        .sales-product-table td:nth-child(2),
+        .sales-product-table th:nth-child(2),
+        .sales-product-table td:nth-child(3),
+        .sales-product-table th:nth-child(3),
+        .sales-day-table td:nth-child(2),
+        .sales-day-table th:nth-child(2) {
+            text-align: right;
+            white-space: nowrap;
+        }
+
+        .sales-product-table td:last-child,
+        .sales-product-table th:last-child,
+        .sales-day-table td:last-child,
+        .sales-day-table th:last-child {
+            width: 96px;
+        }
+
+        .sales-day-table td:first-child,
+        .sales-day-table th:first-child {
+            width: 72px;
+            white-space: nowrap;
         }
 
         @media print {
@@ -584,6 +1012,46 @@ def apply_print_styles():
                 page-break-inside: avoid;
                 break-inside: avoid;
             }
+
+            .sales-print-area {
+                width: 186mm !important;
+                max-width: 186mm !important;
+            }
+
+            .sales-print-area .print-header {
+                margin-bottom: 10px;
+                padding-bottom: 8px;
+            }
+
+            .sales-print-area .print-header h1 {
+                font-size: 18px !important;
+            }
+
+            .sales-print-area .print-date {
+                font-size: 12px !important;
+            }
+
+            .sales-print-area .print-section {
+                margin-top: 10px;
+            }
+
+            .sales-print-area .print-section h2 {
+                font-size: 12px !important;
+                margin-bottom: 4px !important;
+            }
+
+            .sales-print-area .print-table {
+                font-size: 9.5px !important;
+            }
+
+            .sales-print-area .print-table th,
+            .sales-print-area .print-table td {
+                padding: 2px 4px !important;
+            }
+
+            .sales-print-columns {
+                gap: 10px;
+            }
         }
         </style>
         """,
@@ -595,7 +1063,10 @@ st.set_page_config(page_title="注文集計アプリ", layout="wide")
 apply_print_styles()
 
 st.sidebar.title("メニュー")
-menu = st.sidebar.radio("表示する画面", ["アップロード", "集計", "注文票PDF"])
+menu = st.sidebar.radio(
+    "表示する画面",
+    ["アップロード", "集計", "当月売上", "注文票PDF"],
+)
 
 if "df" in st.session_state:
     st.sidebar.success("CSV読み込み済み")
@@ -665,6 +1136,7 @@ elif menu == "集計":
     )
     selected_summary_df = summary_df[summary_df["集計日"] == selected_date].copy()
     selected_times = None
+    selected_time_products = None
     time_product_summary = pd.DataFrame(columns=["時刻", "商品名", "数量"])
 
     if has_time_column:
@@ -696,16 +1168,36 @@ elif menu == "集計":
     )
 
     if has_time_column and selected_times:
-        time_product_summary = (
-            selected_summary_df.dropna(subset=["商品名"])
-            .groupby(["集計時刻", "商品名"], as_index=False)["集計数量"]
-            .sum()
-            .rename(columns={"集計時刻": "時刻", "集計数量": "数量"})
+        available_time_products = sorted(
+            selected_summary_df["商品名"].dropna().astype(str).unique().tolist()
         )
-        time_product_summary["_時刻順"] = time_product_summary["時刻"].map(time_sort_key)
-        time_product_summary = time_product_summary.sort_values(
-            ["_時刻順", "商品名"]
-        ).drop(columns=["_時刻順"])
+        if available_time_products:
+            selected_time_products = st.multiselect(
+                "時間帯別集計の商品",
+                available_time_products,
+                default=available_time_products,
+                help="時間帯別の表に含める商品を選べます。",
+            )
+            if not selected_time_products:
+                st.warning("時間帯別集計する商品を選択してください。")
+                st.stop()
+            time_target_df = selected_summary_df[
+                selected_summary_df["商品名"].astype(str).isin(selected_time_products)
+            ]
+            time_product_summary = (
+                time_target_df.dropna(subset=["商品名"])
+                .groupby(["集計時刻", "商品名"], as_index=False)["集計数量"]
+                .sum()
+                .rename(columns={"集計時刻": "時刻", "集計数量": "数量"})
+            )
+            time_product_summary["_時刻順"] = time_product_summary["時刻"].map(
+                time_sort_key
+            )
+            time_product_summary = time_product_summary.sort_values(
+                ["_時刻順", "商品名"]
+            ).drop(columns=["_時刻順"])
+        else:
+            st.info("選択した時間帯には商品データがありません。")
 
     selected_summary_df["ステーキ切り落とし対象"] = selected_summary_df["商品名"].map(
         matches_steak_cut_product
@@ -763,8 +1255,129 @@ elif menu == "集計":
             steak_name_summary,
             selected_times=selected_times,
             time_product_summary=time_product_summary,
+            selected_time_products=selected_time_products,
         ),
         unsafe_allow_html=True,
+    )
+
+elif menu == "当月売上":
+    st.title("当月売上集計")
+    if "df" not in st.session_state:
+        st.info("先にアップロード画面でCSVファイルを読み込んでください。")
+        st.stop()
+
+    df = st.session_state.df
+    required_sales_columns = ["お渡し日", "商品名", "数量", "金額", "店舗名"]
+    missing_sales_columns = [
+        column for column in required_sales_columns if column not in df.columns
+    ]
+    if missing_sales_columns:
+        st.error(f"売上集計に必要な列が見つかりません: {', '.join(missing_sales_columns)}")
+        st.stop()
+
+    sales_df = prepare_sales_df(df)
+    order_sales_df = filter_order_sales_df(sales_df)
+    product_sales_df = filter_product_sales_df(sales_df)
+    available_months = sorted(
+        pd.concat([order_sales_df["集計月"], product_sales_df["集計月"]])
+        .dropna()
+        .unique()
+    )
+    if not available_months:
+        st.warning("お渡し日として読み取れる日付がありません。")
+        st.stop()
+
+    today = date.today()
+    current_month = pd.Period(today, freq="M")
+    default_month = (
+        current_month if current_month in available_months else available_months[-1]
+    )
+    month_options = [format_month_label(month) for month in available_months]
+    default_month_label = format_month_label(default_month)
+    selected_month_label = st.selectbox(
+        "集計月",
+        month_options,
+        index=month_options.index(default_month_label),
+        help="初期値は当月です。CSVに当月データがない場合は最新月を表示します。",
+    )
+    selected_month = available_months[month_options.index(selected_month_label)]
+    month_order_df = order_sales_df[order_sales_df["集計月"] == selected_month].copy()
+    month_product_df = product_sales_df[
+        product_sales_df["集計月"] == selected_month
+    ].copy()
+
+    if month_order_df.empty and month_product_df.empty:
+        st.warning(f"{selected_month_label}の売上データがありません。")
+        st.stop()
+
+    if month_order_df.empty:
+        st.warning(
+            "「税込金額」行がないため、店舗別・日にち別は商品行の金額で集計しています。"
+        )
+        amount_sales_df = month_product_df
+    else:
+        amount_sales_df = month_order_df
+
+    store_summary = aggregate_sales_by_store(amount_sales_df)
+    store_product_summary = aggregate_sales_by_store_product(month_product_df)
+    store_day_summary = aggregate_sales_by_store_day(amount_sales_df)
+    reconciliation = build_sales_amount_reconciliation(
+        month_product_df,
+        month_order_df,
+    )
+
+    if month_order_df.empty:
+        st.info("税込金額行がないため、照合はスキップしています。")
+    elif reconciliation["matched"]:
+        st.success(
+            "商品合計（数量×単価）と税込金額合計は一致しています: "
+            f"{format_amount(reconciliation['order_total'])}"
+        )
+    else:
+        st.error(
+            "商品合計と税込金額が一致しません。 "
+            f"商品合計 {format_amount(reconciliation['product_total'])} / "
+            f"税込金額 {format_amount(reconciliation['order_total'])} / "
+            f"差額 {format_amount(reconciliation['difference'])}"
+        )
+        if not reconciliation["mismatch_orders"].empty:
+            st.caption("不一致の注文（先頭20件）")
+            mismatch_preview = reconciliation["mismatch_orders"].head(20).copy()
+            mismatch_preview["注文番号"] = mismatch_preview["注文番号"].map(
+                format_integer_value
+            )
+            for column in ["商品合計", "税込金額", "差額"]:
+                mismatch_preview[column] = mismatch_preview[column].map(format_amount)
+            st.dataframe(mismatch_preview, use_container_width=True, hide_index=True)
+
+    components.html(
+        """
+        <button
+            onclick="window.parent.print()"
+            style="
+                appearance: none;
+                border: 1px solid #2563eb;
+                background: #2563eb;
+                color: white;
+                border-radius: 6px;
+                padding: 9px 16px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+            "
+        >
+            A4で印刷
+        </button>
+        """,
+        height=48,
+    )
+    st.html(
+        build_sales_print_report(
+            selected_month_label,
+            store_summary,
+            store_product_summary,
+            store_day_summary,
+        )
     )
 
 elif menu == "注文票PDF":
