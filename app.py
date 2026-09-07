@@ -171,13 +171,19 @@ def filter_order_sales_df(sales_df):
     return sales_df[sales_df["商品名"].isin(TICKET_AMOUNT_PRODUCT_NAMES)].copy()
 
 
+def is_nonzero_sales_amount(series):
+    amount = pd.to_numeric(series, errors="coerce").fillna(0)
+    return amount != 0
+
+
 def filter_product_sales_df(sales_df):
-    """商品別集計用。クーポン・税抜・税込の行は除外する。"""
-    return sales_df[
+    """商品別集計用。クーポン・税抜・税込の行と0円の商品は除外する。"""
+    product_df = sales_df[
         sales_df["商品名"].notna()
         & (sales_df["商品名"] != "")
         & ~sales_df["商品名"].isin(SALES_EXCLUDE_PRODUCT_NAMES)
     ].copy()
+    return product_df[is_nonzero_sales_amount(product_df["売上金額"])].copy()
 
 
 def build_sales_amount_reconciliation(product_df, order_df):
@@ -285,11 +291,12 @@ def aggregate_sales_by_store(sales_df):
 
 
 def aggregate_sales_by_store_product(sales_df):
-    return (
+    summary = (
         sales_df.groupby(["店舗名", "商品名"], as_index=False)
         .agg(数量=("集計数量", "sum"), 売上金額=("売上金額", "sum"))
         .sort_values(["店舗名", "売上金額", "商品名"], ascending=[True, False, True])
     )
+    return summary[is_nonzero_sales_amount(summary["売上金額"])].copy()
 
 
 def aggregate_sales_by_store_day(sales_df):
@@ -387,6 +394,7 @@ def build_sales_print_report(
     store_summary,
     store_product_summary,
     store_day_summary,
+    allow_extra_pages=False,
 ):
     total_amount = store_summary["売上金額"].sum()
     store_rows = []
@@ -421,16 +429,19 @@ def build_sales_print_report(
     detail_sections_html = "\n".join(detail_sections)
     period_text = html.escape(sanitize_print_text(period_label))
     total_text = html.escape(format_amount(total_amount))
+    layout_class = (
+        "sales-print-multipage" if allow_extra_pages else "sales-print-fit"
+    )
 
     return f"""
-<div class="print-area sales-print-area">
+<div class="print-area sales-print-area {layout_class}">
     <div class="print-header">
         <h1>当月売上集計</h1>
         <div class="print-date">期間: {period_text}</div>
     </div>
     <div class="print-section-meta">
         店舗別・日にち別は「税込金額」。商品別は数量が2以上のとき数量×単価、それ以外は金額列を集計。
-        表示順は神宮寺店 → STAND です。
+        0円の商品は除外。表示順は神宮寺店 → STAND です。
     </div>
 
     <section class="print-section sales-summary-section">
@@ -1052,6 +1063,33 @@ def apply_print_styles():
             .sales-print-columns {
                 gap: 10px;
             }
+
+            .print-area.sales-print-area.sales-print-multipage {
+                position: absolute !important;
+                left: 0 !important;
+                top: 0 !important;
+                transform: none !important;
+                width: 186mm !important;
+                max-width: 186mm !important;
+                height: auto !important;
+                overflow: visible !important;
+                page-break-inside: auto !important;
+                break-inside: auto !important;
+            }
+
+            .sales-print-multipage .store-detail-section {
+                page-break-inside: auto;
+                break-inside: auto;
+            }
+
+            .sales-print-multipage .print-table thead {
+                display: table-header-group;
+            }
+
+            .sales-print-multipage .print-table tr {
+                page-break-inside: avoid;
+                break-inside: avoid;
+            }
         }
         </style>
         """,
@@ -1350,6 +1388,11 @@ elif menu == "当月売上":
                 mismatch_preview[column] = mismatch_preview[column].map(format_amount)
             st.dataframe(mismatch_preview, use_container_width=True, hide_index=True)
 
+    allow_extra_pages = st.checkbox(
+        "A4に収まらないときはページを増やす",
+        value=False,
+        help="オフのときは1枚に収めます。商品が多くて切れるときはオンにしてください。",
+    )
     components.html(
         """
         <button
@@ -1377,6 +1420,7 @@ elif menu == "当月売上":
             store_summary,
             store_product_summary,
             store_day_summary,
+            allow_extra_pages=allow_extra_pages,
         )
     )
 
