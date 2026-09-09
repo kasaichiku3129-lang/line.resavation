@@ -472,6 +472,7 @@ def build_sales_print_report(
 
 def get_japanese_font():
     font_paths = [
+        Path(__file__).resolve().parent / "fonts" / "NotoSansJP-Regular.otf",
         Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
         Path("/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf"),
         Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"),
